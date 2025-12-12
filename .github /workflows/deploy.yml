@@ -1,0 +1,76 @@
+name: CI/CD for FastAPI App
+
+on:
+  push:
+    branches: [ main, master ]
+    
+jobs:
+  build-and-push:
+    runs-on: self-hosted
+    outputs:
+      sha: ${{ steps.set-sha.outputs.sha }}
+      
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fix podman state
+        run: |
+          podman system migrate || true
+          podman system reset --force || true
+
+      - name: SHA
+        id: set-sha
+        run: echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | podman login ghcr.io -u anna-lipchanskaya --password-stdin
+
+      - name: Build and push test image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}/app:test-${{ github.sha }}
+          podman build --target test -t $IMAGE .
+          podman push $IMAGE
+
+      - name: Build and push runtime image
+        run: |
+          IMAGE_SHA=ghcr.io/${{ github.repository }}/app:runtime-${{ github.sha }}
+          IMAGE_LATEST=ghcr.io/${{ github.repository }}/app:latest
+          podman build --target runtime -t $IMAGE_SHA -t $IMAGE_LATEST .
+          podman push $IMAGE_SHA
+          podman push $IMAGE_LATEST
+
+  test:
+    runs-on: self-hosted
+    needs: build-and-push
+    steps:
+      - name: Run tests
+        run: |
+          set -e
+          IMAGE=ghcr.io/${{ github.repository }}/app:test-${{ github.sha }}
+          echo "${{ secrets.GHCR_PAT }}" | podman login ghcr.io -u anna-lipchanskaya --password-stdin
+          podman run --rm --network host $IMAGE
+          podman rmi $IMAGE || true
+
+  deploy:
+    runs-on: self-hosted
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Deploy
+        run: |
+          set -e
+          echo "${{ secrets.GHCR_PAT }}" | podman login ghcr.io -u anna-lipchanskaya --password-stdin
+
+          podman stop app || true
+          podman rm -f app || true
+
+          podman run --replace -d \
+            --name app \
+            --restart always \
+            -p 8112:8112 \
+            ghcr.io/${{ github.repository }}/app:latest
+
+          podman images --format "{{.Repository}}:{{.Tag}}" \
+            | grep '/app:runtime-' \
+            | grep -v "${{ github.sha }}" \
+            | xargs -r podman rmi -f || true
